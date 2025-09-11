@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+import os
+import requests
+import logging
+import time
+import hashlib
+import json
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+import pandas as pd  # for CSV export (flattening)
+
+BASE_URL = "https://api.samsara.com/fleet/safety-events"
+
+# ---------- LOGGING ----------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# ---------- CONFIG: last 7 days ----------
+NOW_UTC = datetime.now(timezone.utc)
+START_TIME_ISO = (NOW_UTC - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+END_TIME_ISO   = NOW_UTC.strftime("%Y-%m-%dT%H:%M:%SZ")
+LIMIT_PER_PAGE = 200
+
+# Optional filters
+EVENT_TYPES = None            # e.g. ["HARSH_BRAKING","DISTRACTED_DRIVING"]
+MIN_SEVERITY = None           # e.g. "MEDIUM" or "HIGH"
+INCLUDE_DISMISSED = True      # set False to exclude dismissed
+
+# Output switches
+PRINT_FIRST_EVENT_HEADERS = True
+PRINT_PAGE_WINDOW_DEBUG   = True
+PRINT_FIRST_EVENT_JSON    = True
+
+# Loop safeties
+MAX_PAGES           = 500          # total requests budget
+MAX_RUNTIME_SEC     = 480          # wall-clock ceiling
+PAGE_HASH_REPEAT_LIMIT = 2         # duplicated page → fallback to time-walk
+REQUEST_TIMEOUT     = 30
+
+# Timezone formatting
+LOCAL_TZ = ZoneInfo("America/New_York")
+DATE_TIME_FMT = "%m/%d/%Y %H:%M"    # e.g. 08/12/2025 07:45
+
+# ---------- CSV OUTPUT ----------
+OUTPUT_DIR = r"C:\Users\JonathanJoseph\OneDrive - United Utility\SamsaraSafety"
+TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+OUTPUT_CSV = os.path.join(OUTPUT_DIR, f"samsara_safety_events_last7d_{TIMESTAMP}.csv")
+OUTPUT_JSON = os.path.join(OUTPUT_DIR, f"samsara_safety_events_last7d_{TIMESTAMP}.json")
+
+# ---------- HELPERS ----------
+def get_api_token():
+    token = os.getenv("SAMSARA_API_TOKEN")
+    if not token:
+        logging.error("Missing SAMSARA_API_TOKEN environment variable.")
+        raise SystemExit(1)
+    return token
+
+def do_get(url, headers, params=None, timeout=REQUEST_TIMEOUT, max_retries=5):
+    """Retry on 429/5xx with exponential backoff."""
+    backoff = 0.5
+    for attempt in range(1, max_retries + 1):
+        r = requests.get(url, headers=headers, params=params, timeout=timeout)
+        if r.status_code < 400:
+            return r
+        if r.status_code in (429, 500, 502, 503, 504):
+            logging.warning(f"HTTP {r.status_code} (attempt {attempt}/{max_retries}); backing off {backoff:.1f}s")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 8.0)
+            continue
+        r.raise_for_status()
+    r.raise_for_status()
+    return r  # not reached
+
+def parse_iso_utc(iso_str: str | None) -> datetime | None:
+    if not iso_str:
+        return None
+    s = iso_str[:-1] + "+00:00" if iso_str.endswith("Z") else iso_str
+    try:
+        return datetime.fromisoformat(s).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+def best_event_ts_utc(ev) -> datetime | None:
+    # prioritize explicit event time, then start/end/detected/created
+    for k in ("time", "startTime", "endTime", "detectedAt", "createdAt"):
+        dt = parse_iso_utc(ev.get(k))
+        if dt:
+            return dt
+    return None
+
+def to_et_str(dt_utc: datetime | None) -> str | None:
+    return dt_utc.astimezone(LOCAL_TZ).strftime(DATE_TIME_FMT) if dt_utc else None
+
+def enrich_events_with_times(events):
+    """Add UTC + ET normalized fields so CSV has consistent columns."""
+    out = []
+    for e in events:
+        ev = dict(e)
+        t_utc  = parse_iso_utc(e.get("time"))
+        st_utc = parse_iso_utc(e.get("startTime"))
+        et_utc = parse_iso_utc(e.get("endTime"))
+        det_utc = parse_iso_utc(e.get("detectedAt"))
+        crt_utc = parse_iso_utc(e.get("createdAt"))
+
+        event_utc = t_utc or st_utc or et_utc or det_utc or crt_utc
+
+        ev["eventTime"] = event_utc.isoformat().replace("+00:00","Z") if event_utc else None
+        ev["eventStartTime"] = (st_utc or t_utc).isoformat().replace("+00:00","Z") if (st_utc or t_utc) else None
+        ev["eventEndTime"]   = (et_utc or t_utc).isoformat().replace("+00:00","Z") if (et_utc or t_utc) else None
+
+        ev["eventTime_et"]      = to_et_str(event_utc)
+        ev["eventStartTime_et"] = to_et_str(st_utc or t_utc)
+        ev["eventEndTime_et"]   = to_et_str(et_utc or t_utc)
+        out.append(ev)
+    return out
+
+def save_events_to_csv(events, out_path):
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    events = enrich_events_with_times(events)
+    df = pd.json_normalize(events, sep='.')
+    # JSON-encode lists/dicts for clean CSV
+    for col in df.columns:
+        df[col] = df[col].apply(lambda x: json.dumps(x) if isinstance(x, (list, dict)) else x)
+
+    # Put key columns first if present
+    lead_cols = [c for c in [
+        "eventTime_et","eventStartTime_et","eventEndTime_et",
+        "eventTime","eventStartTime","eventEndTime",
+        "time","startTime","endTime",
+        "id","type","severity",
+        "vehicle.id","vehicle.name","driver.id","driver.name",
+        "location.latitude","location.longitude"
+    ] if c in df.columns]
+    other_cols = [c for c in df.columns if c not in lead_cols]
+    df = df[lead_cols + other_cols]
+
+    df.to_csv(out_path, index=False, encoding="utf-8-sig")
+    return out_path, len(df)
+
+# ---------- FETCH (cursor with time-walk fallback) ----------
+def fetch_last_7_days_with_fallback(start_iso: str, end_iso: str):
+    headers = {"accept": "application/json", "authorization": f"Bearer {get_api_token()}"}
+
+    start_dt = parse_iso_utc(start_iso)
+    current_end_dt = parse_iso_utc(end_iso)
+
+    events = []
+    pages = 0
+    start_clock = time.time()
+
+    # state for cursor mode
+    cursor = None
+    next_url = None
+    page_hash_counts = {}
+
+    while current_end_dt and current_end_dt > start_dt:
+        if time.time() - start_clock > MAX_RUNTIME_SEC:
+            logging.warning("Max runtime reached. Stopping.")
+            break
+        if pages >= MAX_PAGES:
+            logging.warning("Hit hard page cap. Stopping.")
+            break
+
+        # Build request
+        params = {
+            "startTime": start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "endTime": current_end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "limit": LIMIT_PER_PAGE,
+        }
+        if EVENT_TYPES: params["eventTypes"] = ",".join(EVENT_TYPES)
+        if MIN_SEVERITY: params["minSeverity"] = MIN_SEVERITY
+        if not INCLUDE_DISMISSED: params["includeDismissed"] = "false"
+        if cursor: params["startingAfter"] = cursor
+
+        url = next_url if next_url else BASE_URL
+        used_params = None if next_url else params
+
+        logging.info(f"[{params['startTime']}..{params['endTime']}] Requesting safety events... Cursor: {cursor}")
+        try:
+            resp = do_get(url, headers, params=used_params)
+        except requests.RequestException as e:
+            logging.error(f"Request failed: {e}")
+            break
+
+        data = resp.json() or {}
+        batch = data.get("data", []) or []
+
+        # Debug: window + pagination
+        pagination = data.get("pagination", {}) or {}
+        first_id = batch[0].get("id") if batch else None
+        last_id  = batch[-1].get("id") if batch else None
+        first_ts = (batch[0].get("startTime") or batch[0].get("time")) if batch else None
+        last_ts  = (batch[-1].get("startTime") or batch[-1].get("time")) if batch else None
+        if PRINT_PAGE_WINDOW_DEBUG:
+            logging.info(f"Pagination: {pagination}")
+            logging.info(f"Page window: first(id={first_id}, ts={first_ts})  last(id={last_id}, ts={last_ts})")
+
+        # Duplicate-page detection (cursor path)
+        if batch:
+            try:
+                ids = [ev.get("id") or ev.get("eventId") or "" for ev in batch]
+                sig_src = "|".join(ids) if any(ids) else json.dumps(batch, sort_keys=True, default=str)
+            except Exception:
+                sig_src = json.dumps(batch, sort_keys=True, default=str)
+            sig = hashlib.sha256(sig_src.encode()).hexdigest()
+            page_hash_counts[sig] = page_hash_counts.get(sig, 0) + 1
+
+        # Save everything (NO DEDUP)
+        events.extend(batch)
+        logging.info(f"Fetched {len(batch)} events (running total: {len(events)})")
+        pages += 1
+
+        # Pagination fields
+        next_url = pagination.get("next") or pagination.get("nextUrl")
+        next_cursor = pagination.get("endCursor")
+        has_next = pagination.get("hasNextPage", False)
+
+        # If normal cursor pagination is working, continue it
+        if has_next and next_cursor and page_hash_counts.get(sig, 0) <= PAGE_HASH_REPEAT_LIMIT:
+            cursor = next_cursor
+            # keep current_end_dt the same
+            time.sleep(0.2)
+            continue
+
+        # Otherwise: FALL BACK to time-walk — step the endTime back
+        # Find the oldest timestamp on this page; if none, step back 5 minutes
+        oldest = None
+        for ev in batch:
+            ts = best_event_ts_utc(ev)
+            if ts and (oldest is None or ts < oldest):
+                oldest = ts
+
+        if oldest:
+            # move end time just before oldest to avoid re-fetching same rows
+            current_end_dt = oldest - timedelta(milliseconds=1)
+            logging.info(f"FALLBACK: stepping endTime back to {current_end_dt.isoformat().replace('+00:00','Z')}")
+        else:
+            # no timestamps? step back a few minutes to force progress
+            current_end_dt = current_end_dt - timedelta(minutes=5)
+            logging.info(f"FALLBACK: no timestamps found; stepping endTime back 5 minutes to {current_end_dt.isoformat().replace('+00:00','Z')}")
+
+        # reset cursor state for the new (earlier) window
+        cursor = None
+        next_url = None
+        page_hash_counts.clear()
+        time.sleep(0.2)
+
+    return events, pages, int(time.time() - start_clock)
+
+# ---------- MAIN ----------
+if __name__ == "__main__":
+    events, pages, runtime_sec = fetch_last_7_days_with_fallback(START_TIME_ISO, END_TIME_ISO)
+
+    if not events:
+        logging.warning("No safety events found in last 7 days.")
+        raise SystemExit(0)
+
+    print("\n=== SUMMARY (Last 7 Days) ===")
+    print(f"Events returned (no dedup): {len(events)}")
+    print(f"Requests made: {pages}")
+    print(f"Runtime (sec): {runtime_sec}")
+
+    # First event headers + raw JSON (so you can see the real payload)
+    if PRINT_FIRST_EVENT_HEADERS:
+        first_event = events[0]
+        print("\n=== FIRST EVENT HEADERS ===")
+        for k in sorted(first_event.keys()):
+            print(k)
+    if PRINT_FIRST_EVENT_JSON:
+        print("\n=== FIRST EVENT JSON (RAW) ===")
+        print(json.dumps(events[0], indent=2, ensure_ascii=False))
+
+    # Save JSON dump (all events) alongside CSV for auditing
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
+        json.dump(events, f, indent=2, ensure_ascii=False)
+    print(f"\nSaved raw JSON to:\n{OUTPUT_JSON}")
+
+    # Save CSV with ET-formatted time columns up front
+    out_path, rows = save_events_to_csv(events, OUTPUT_CSV)
+    print(f"Saved {rows} rows to:\n{out_path}")

@@ -1,0 +1,612 @@
+import os
+import csv
+import time
+import json
+import random
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Optional, Tuple
+
+# =========================
+# CONFIG
+# =========================
+DISPLAY_TZ = os.getenv("DISPLAY_TZ", "America/New_York")
+CSV_FILE = os.getenv("CSV_FILE", r"C:\Users\JonathanJoseph\OneDrive - United Utility\Samsara Safety Dashboard\vehicle_safety_report.csv")
+LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "7"))
+
+# Speed/Resilience
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "10"))
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
+BACKOFF_BASE = float(os.getenv("BACKOFF_BASE", "0.75"))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "60"))
+PAGE_PAUSE_SEC = float(os.getenv("PAGE_PAUSE_SEC", "0.12"))
+MAX_PAGES_SAFEGUARD = int(os.getenv("MAX_PAGES_SAFEGUARD", "20000"))
+
+ALIGN_WE_TO_LAST_SUNDAY = os.getenv("ALIGN_WE_TO_LAST_SUNDAY", "false").lower() in ("1","true","yes")
+HEADERS_BASE = {"Accept": "application/json"}
+
+# Skip vehicles with zero activity in window (helpful for parked/retired)
+SKIP_ZERO_ACTIVITY = os.getenv("SKIP_ZERO_ACTIVITY", "true").lower() in ("1","true","yes")
+
+# Tag hints for inactive/archived
+INACTIVE_TAG_HINTS = [s.strip().lower() for s in os.getenv("INACTIVE_TAG_HINTS", "archived|archive|retired|decommissioned|inactive|disposed").split("|") if s.strip()]
+
+# =========================
+# TIME HELPERS
+# =========================
+def _zoneinfo(name: str):
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(name)
+    except Exception:
+        return None
+
+def fmt_hms(ms: Optional[int]) -> str:
+    if not ms or ms <= 0:
+        return "0:00:00"
+    s = int(round(ms / 1000))
+    h = s // 3600
+    m = (s % 3600) // 60
+    sec = s % 60
+    return f"{h}:{m:02d}:{sec:02d}"
+
+def hms_to_seconds(hms: str) -> int:
+    try:
+        h, m, s = hms.split(":")
+        return int(h) * 3600 + int(m) * 60 + int(s)
+    except Exception:
+        return 0
+
+def meters_to_miles(m: Optional[float]) -> float:
+    return (m or 0.0) * 0.000621371
+
+def fmt_miles(m: Optional[float]) -> str:
+    return f"{meters_to_miles(m):.1f}"
+
+def utc_now_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+def align_to_last_sunday(end_ms: int) -> int:
+    tz = _zoneinfo(DISPLAY_TZ)
+    dt = datetime.fromtimestamp(end_ms/1000, tz=timezone.utc).astimezone(tz) if tz else datetime.fromtimestamp(end_ms/1000).astimezone()
+    delta_days = (dt.weekday() + 1) % 7
+    last_sun = (dt - timedelta(days=delta_days)).replace(hour=23, minute=59, second=59, microsecond=0)
+    last_sun_utc = last_sun.astimezone(timezone.utc)
+    return int(last_sun_utc.timestamp() * 1000)
+
+def fmt_we_date(end_ms: int, tz_name: str) -> str:
+    tz = _zoneinfo(tz_name)
+    dt = datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc)
+    dt_local = dt.astimezone(tz) if tz else dt.astimezone()
+    if os.name == "nt":
+        return dt_local.strftime("%#m/%#d/%Y")
+    return dt_local.strftime("%-m/%-d/%Y")
+
+def fmt_compact_local(ms: Optional[int], tz_name: str) -> str:
+    if not ms:
+        return ""
+    tz = _zoneinfo(tz_name)
+    dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    dt_local = dt.astimezone(tz) if tz else dt.astimezone()
+    fmt = "%b %#d %#I:%M%p %Z" if os.name == "nt" else "%b %-d %-I:%M%p %Z"
+    return dt_local.strftime(fmt)
+
+# =========================
+# AUTH & HTTP
+# =========================
+def get_api_token() -> str:
+    token = os.getenv("SAMSARA_API_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("Missing SAMSARA_API_TOKEN environment variable.")
+    return token
+
+def auth_headers() -> Dict[str, str]:
+    return {**HEADERS_BASE, "Authorization": f"Bearer {get_api_token()}"}
+
+def log(msg: str):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now}] {msg}", flush=True)
+
+def pp_json(title: str, obj: Any):
+    print(f"\n=== {title} ===")
+    try:
+        print(json.dumps(obj, indent=2, sort_keys=True))
+    except Exception:
+        print(repr(obj))
+
+# =========================
+# PAGINATED FETCH
+# =========================
+def fetch_all(url: str, params: Dict[str, Any], label: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    page = 0
+    seen_cursors = set()
+    while True:
+        page += 1
+        if page > MAX_PAGES_SAFEGUARD:
+            raise RuntimeError(f"{label}: exceeded {MAX_PAGES_SAFEGUARD} pages; aborting.")
+        pr = {k: v for k, v in params.items()
+              if k not in ("limit", "after", "startingAfter", "cursor", "pageToken", "nextToken")}
+        log(f"GET {label} page {page} params={pr}")
+        r = requests.get(url, headers=auth_headers(), params=params, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 401:
+            raise PermissionError(f"401 {label}: {r.text[:200]}")
+        r.raise_for_status()
+        data = r.json()
+
+        items = None
+        for k in ("data", "items", "vehicles", "results"):
+            if isinstance(data, dict) and isinstance(data.get(k), list):
+                items = data[k]; break
+        if items is None:
+            items = data if isinstance(data, list) else []
+
+        if not items:
+            log(f"{label}: +0 (done)")
+            break
+
+        out.extend(items)
+        log(f"{label}: +{len(items)} (total {len(out)})")
+
+        pag = data.get("pagination") or data.get("page") or {}
+        next_cursor = None
+        token_name = None
+        has_more = False
+        if isinstance(pag, dict):
+            has_more = bool(pag.get("hasNextPage") or pag.get("hasMore") or pag.get("more"))
+            if pag.get("nextPageToken"):
+                next_cursor = pag["nextPageToken"]; token_name = "pageToken"
+            elif pag.get("endCursor") or pag.get("nextCursor") or pag.get("cursor"):
+                next_cursor = pag.get("endCursor") or pag.get("nextCursor") or pag.get("cursor")
+                token_name = "after"
+        if not next_cursor and isinstance(data, dict) and data.get("nextToken"):
+            next_cursor = data["nextToken"]; token_name = "nextToken"; has_more = bool(next_cursor)
+
+        if not has_more or not next_cursor:
+            break
+
+        key = f"{token_name}:{next_cursor}"
+        if key in seen_cursors:
+            log(f"{label}: cursor repeated; stopping.")
+            break
+        seen_cursors.add(key)
+
+        for k in ("after", "startingAfter", "pageToken", "nextToken", "cursor"):
+            if k in params and k != token_name:
+                params.pop(k, None)
+        params[token_name] = next_cursor
+        time.sleep(PAGE_PAUSE_SEC)
+    return out
+
+# =========================
+# SAFE GETTERS
+# =========================
+def safe_get(d: Any, *path, default=None):
+    cur = d
+    for p in path:
+        if not isinstance(cur, dict) or p not in cur:
+            return default
+        cur = cur[p]
+    return cur
+
+def first_of(d: Dict[str, Any], candidates: List[Tuple[str, ...]], default=None):
+    for path in candidates:
+        v = safe_get(d, *path, default=None)
+        if v is not None:
+            return v
+    return default
+
+# =========================
+# TAGS
+# =========================
+def fetch_tags_map() -> Dict[str, Dict[str, Any]]:
+    endpoints = ["https://api.samsara.com/fleet/tags", "https://api.samsara.com/tags"]
+    last_err = None
+    for url in endpoints:
+        try:
+            tags: List[Dict[str, Any]] = fetch_all(url, {"limit": 500}, "tags")
+            m: Dict[str, Dict[str, Any]] = {}
+            for t in tags:
+                tid = str(t.get("id") or t.get("tagId") or "")
+                if not tid:
+                    continue
+                m[tid] = {"name": t.get("name", ""), "parents": t.get("parentTagIds") or t.get("parentIds") or []}
+            if m:
+                return m
+        except Exception as e:
+            last_err = e
+            continue
+    log(f"⚠️ Could not fetch Tags; Tag Paths will be blank. ({last_err})")
+    return {}
+
+def _build_path(tag_id: str, tags_map: Dict[str, Dict[str, Any]], cache: Dict[str, str]) -> str:
+    if tag_id in cache:
+        return cache[tag_id]
+    t = tags_map.get(tag_id)
+    if not t:
+        cache[tag_id] = ""
+        return ""
+    parents = t.get("parents") or []
+    parent_paths = []
+    for pid in parents:
+        p = _build_path(str(pid), tags_map, cache)
+        if p:
+            parent_paths.append(p)
+    base = " / ".join(pp for pp in parent_paths if pp)
+    out = (base + " / " + t["name"]) if base else t["name"]
+    cache[tag_id] = out
+    return out
+
+def tag_names_and_paths(tag_objs_or_names: Any, tags_map: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
+    names: List[str] = []
+    paths: List[str] = []
+    cache: Dict[str, str] = {}
+    seen_names = set()
+    if isinstance(tag_objs_or_names, list):
+        for t in tag_objs_or_names:
+            if isinstance(t, str):
+                nm = t.strip()
+                if nm and nm not in seen_names:
+                    names.append(nm); seen_names.add(nm)
+            elif isinstance(t, dict):
+                tid = None; nm = None
+                if isinstance(t.get("tag"), dict):
+                    tid = t["tag"].get("id"); nm = t["tag"].get("name")
+                tid = tid or t.get("id")
+                nm = nm or t.get("name")
+                if nm and nm not in seen_names:
+                    names.append(nm.strip()); seen_names.add(nm.strip())
+                if tid and tags_map:
+                    p = _build_path(str(tid), tags_map, cache)
+                    if p:
+                        paths.append(p)
+    return ", ".join(names), " / ".join(paths) if paths else ""
+
+# =========================
+# VEHICLES + FILTERS
+# =========================
+def is_vehicle_inactive(v: Dict[str, Any]) -> bool:
+    if v.get("isDeactivated") is True: return True
+    if v.get("deactivated")   is True: return True
+    if v.get("active")        is False: return True
+    if v.get("isArchived")    is True: return True
+    if v.get("archived")      is True: return True
+    for k in ("status", "vehicleStatus", "lifecycleStatus"):
+        val = str(v.get(k, "")).strip().lower()
+        if val in {"archived","inactive","deactivated","retired","disposed"}:
+            return True
+    tags = v.get("tags") or v.get("tagIds") or []
+    tag_names = []
+    if isinstance(tags, list):
+        for t in tags:
+            if isinstance(t, str):
+                tag_names.append(t.lower())
+            elif isinstance(t, dict):
+                nm = t.get("name") or safe_get(t, "tag", "name", default="")
+                if nm:
+                    tag_names.append(nm.lower())
+    if any(any(h in tn for h in INACTIVE_TAG_HINTS) for tn in tag_names):
+        return True
+    return False
+
+def fetch_all_vehicles() -> List[Dict[str, Any]]:
+    endpoints = [
+        ("https://api.samsara.com/fleet/vehicles", {"limit": 500, "includeDeactivated": "false"}),
+        ("https://api.samsara.com/v1/fleet/vehicles", {"limit": 500})
+    ]
+    for url, params in endpoints:
+        try:
+            return fetch_all(url, params, "vehicles")
+        except Exception:
+            continue
+    return []
+
+# =========================
+# SCORES
+# =========================
+def _vehicle_score_request(session: requests.Session, vehicle_id: str, start_ms: int, end_ms: int) -> Dict[str, Any]:
+    url = f"https://api.samsara.com/v1/fleet/vehicles/{vehicle_id}/safety/score"
+    params = {"startMs": start_ms, "endMs": end_ms}
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            r = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            if r.status_code == 404:
+                return {}
+            if r.status_code in (429, 500, 502, 503, 504):
+                sleep_s = BACKOFF_BASE * (2 ** (attempt - 1)) + random.uniform(0, 0.25)
+                time.sleep(sleep_s); continue
+            r.raise_for_status()
+            return r.json() if r.text else {}
+        except requests.RequestException:
+            sleep_s = BACKOFF_BASE * (2 ** (attempt - 1)) + random.uniform(0, 0.25)
+            time.sleep(sleep_s)
+    return {}
+
+def fetch_vehicle_scores_concurrent(vehicles: List[Dict[str, Any]], start_ms: int, end_ms: int) -> Dict[str, Dict[str, Any]]:
+    results: Dict[str, Dict[str, Any]] = {}
+    session = requests.Session()
+    session.headers.update(auth_headers())
+
+    def worker(v: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        vid = str(v.get("id") or v.get("vehicleId") or v.get("externalIds", {}).get("samsara.vehicleId", ""))
+        if not vid:
+            return "", {}
+        if is_vehicle_inactive(v):
+            return vid, {}
+        data = _vehicle_score_request(session, vid, start_ms, end_ms)
+        return vid, data
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futs = [ex.submit(worker, v) for v in vehicles]
+        for i, fut in enumerate(as_completed(futs), 1):
+            vid, data = fut.result()
+            if vid:
+                results[vid] = data
+            if i % 100 == 0 or i == len(futs):
+                log(f"Scores fetched: {i}/{len(futs)}")
+    session.close()
+    return results
+
+# =========================
+# NORMALIZATION
+# =========================
+def norm_score_block(s: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    def first(d: Dict[str, Any], *names, default=None):
+        for n in names:
+            if n in d and d[n] is not None:
+                return d[n]
+        return default
+
+    out["safetyScore"] = first(s, "safetyScore", "score")
+
+    # driving time/distance – support multiple shapes
+    out["driveTimeMs"]    = first(s, "driveTimeMs", "drivingTimeMs", "driveDurationMs", "totalTimeDrivenMs", default=0)
+    out["distanceMeters"] = first(s, "distanceMeters", "drivingDistanceMeters", "distance", "totalDistanceDrivenMeters", default=0)
+
+    # overspeed – either dict breakdown OR single aggregate; capture total in either case
+    over = first(s, "timeOverSpeedLimitMs", "overSpeedLimitMs", default=None)
+    if isinstance(over, dict):
+        out["overSpeedLightMs"]    = first(over, "light", default=0) or 0
+        out["overSpeedModerateMs"] = first(over, "moderate", default=0) or 0
+        out["overSpeedHeavyMs"]    = first(over, "heavy", default=0) or 0
+        out["overSpeedSevereMs"]   = first(over, "severe", default=0) or 0
+        out["overSpeedTotalMs"]    = (out["overSpeedLightMs"] + out["overSpeedModerateMs"] +
+                                      out["overSpeedHeavyMs"] + out["overSpeedSevereMs"])
+    else:
+        out["overSpeedLightMs"]    = first(s, "timeOverSpeedLimitLightMs",  default=0) or 0
+        out["overSpeedModerateMs"] = first(s, "timeOverSpeedLimitModerateMs", default=0) or 0
+        out["overSpeedHeavyMs"]    = first(s, "timeOverSpeedLimitHeavyMs",  default=0) or 0
+        out["overSpeedSevereMs"]   = first(s, "timeOverSpeedLimitSevereMs", default=0) or 0
+        # NEW: capture aggregate when API only provides total
+        out["overSpeedTotalMs"]    = int(over or 0)
+
+    out["timeOverMaxSpeedMs"] = first(s, "timeOverMaxSpeedMs", "overMaxSpeedMs", default=0) or 0
+    out["maxSpeedMph"]        = first(s, "maxSpeedMph", "maxSpeed", default=None)
+    out["maxSpeedAtMs"]       = first(s, "maxSpeedAtMs", "maxSpeedAt", "maxSpeedTimestampMs", default=None)
+
+    sp = first(s, "speedingEvents", "speedingEventCounts", default={}) or {}
+    out["lightSpeedCount"]    = first(sp, "light", "lightCount", default=0) or 0
+    out["moderateSpeedCount"] = first(sp, "moderate", "moderateCount", default=0) or 0
+    out["heavySpeedCount"]    = first(sp, "heavy", "heavyCount", default=0) or 0
+    out["severeSpeedCount"]   = first(sp, "severe", "severeCount", default=0) or 0
+    out["maxSpeedCount"]      = first(sp, "max", "maxCount", "overMax", default=0) or 0
+
+    out["speedingManualCount"] = first(s, "speedingManualCount", "manualSpeedingCount", default=0) or 0
+
+    def pick(*names):
+        for n in names:
+            if n in s and s[n] is not None:
+                return s[n]
+        return 0
+
+    out.update({
+        "crashCount": pick("crashCount", "crashes"),
+        "followingDistanceCount": pick("followingDistanceCount", "followingDistance"),
+        "following02Manual": pick("followingOf0To2sManualCount", "following02Manual"),
+        "following24Manual": pick("followingOf2To4sManualCount", "following24Manual"),
+        "lateResponseManual": pick("lateResponseManualCount", "lateResponseManual"),
+        "defensiveDrivingManual": pick("defensiveDrivingManualCount", "defensiveDrivingManual"),
+        "nearCollisionManual": pick("nearCollisionManualCount", "nearCollisionManual"),
+        "harshAccel": pick("harshAccelCount", "harshAccelerationCount"),
+        "harshBrake": pick("harshBrakeCount", "harshBrakingCount"),
+        "harshTurn": pick("harshTurnCount", "harshTurningCount"),
+        "mobileUsage": pick("mobileUsageCount", "mobilePhoneUsageCount"),
+        "inattentive": pick("inattentiveDrivingCount", "distractedDrivingCount"),
+        "drowsy": pick("drowsyCount", "drowsyDrivingCount"),
+        "rollingStop": pick("rollingStopCount"),
+        "didNotYieldManual": pick("didNotYieldManualCount"),
+        "ranRedLightManual": pick("ranRedLightManualCount"),
+        "laneDepartureManual": pick("laneDepartureManualCount"),
+        "obstructedCameraAuto": pick("obstructedCameraAutoCount"),
+        "obstructedCameraManual": pick("obstructedCameraManualCount"),
+        "eatingDrinkingManual": pick("eatingDrinkingManualCount"),
+        "smokingManual": pick("smokingManualCount"),
+        "noSeatBelt": pick("noSeatBeltCount", "noSeatbeltCount"),
+        "forwardCollisionWarning": pick("forwardCollisionWarningCount", "fcwCount"),
+    })
+
+    behavior_fields = [
+        "crashCount","followingDistanceCount","following02Manual","following24Manual",
+        "lateResponseManual","defensiveDrivingManual","nearCollisionManual",
+        "harshAccel","harshBrake","harshTurn","mobileUsage","inattentive","drowsy",
+        "rollingStop","didNotYieldManual","ranRedLightManual","laneDepartureManual",
+        "obstructedCameraAuto","obstructedCameraManual","eatingDrinkingManual",
+        "smokingManual","noSeatBelt","forwardCollisionWarning",
+        "lightSpeedCount","moderateSpeedCount","heavySpeedCount","severeSpeedCount","maxSpeedCount",
+    ]
+    out["totalEvents"] = int(sum(int(out.get(k) or 0) for k in behavior_fields))
+    out["totalBehaviors"] = out["totalEvents"]
+    return out
+
+# =========================
+# MAIN
+# =========================
+def main():
+    end_ms_raw = utc_now_ms()
+    end_ms = align_to_last_sunday(end_ms_raw) if ALIGN_WE_TO_LAST_SUNDAY else end_ms_raw
+    start_ms = end_ms - LOOKBACK_DAYS * 24 * 3600 * 1000
+    _ = get_api_token()
+
+    we_date = fmt_we_date(end_ms, DISPLAY_TZ)
+    log(f"Vehicle safety window: {LOOKBACK_DAYS} days ending {we_date}")
+
+    log("Fetching tags…")
+    tags_map = fetch_tags_map()
+
+    log("Fetching vehicles…")
+    vehicles_all = fetch_all_vehicles()
+    log(f"Vehicles returned: {len(vehicles_all)}")
+
+    vehicles = [v for v in vehicles_all if not is_vehicle_inactive(v)]
+    log(f"Active vehicles after filter: {len(vehicles)} (filtered out {len(vehicles_all) - len(vehicles)})")
+
+    vid_to_vehicle: Dict[str, Dict[str, Any]] = {}
+    for v in vehicles:
+        vid = str(v.get("id") or v.get("vehicleId") or v.get("externalIds", {}).get("samsara.vehicleId", ""))
+        if vid:
+            vid_to_vehicle[vid] = v
+
+    log("Fetching vehicle scores (concurrent)…")
+    scores_by_vehicle = fetch_vehicle_scores_concurrent(vehicles, start_ms, end_ms)
+
+    rows: List[Dict[str, Any]] = []
+    for v in vehicles:
+        vid = str(v.get("id") or v.get("vehicleId") or "")
+        if not vid:
+            continue
+
+        vname = v.get("name") or v.get("vehicleName") or v.get("label") or "-"
+        make = v.get("make") or v.get("vehicleMake") or ""
+        model = v.get("model") or v.get("vehicleModel") or ""
+        make_model = f"{make}/{model}".strip("/") if make or model else ""
+
+        tags_val = v.get("tags") or v.get("tagIds") or []
+        vehicle_tags, tag_paths = tag_names_and_paths(tags_val, tags_map)
+
+        sraw = scores_by_vehicle.get(vid, {}) or {}
+        s = norm_score_block(sraw)
+
+        if SKIP_ZERO_ACTIVITY and (int(s.get("driveTimeMs") or 0) == 0) and (float(s.get("distanceMeters") or 0) == 0):
+            continue
+
+        drive_ms = s.get("driveTimeMs") or 0
+        def pct(part_ms):
+            if not drive_ms or not part_ms:
+                return ""
+            return round(100.0 * part_ms / drive_ms, 2)
+
+        row = {
+            "WE Date": we_date,
+            "Vehicle Name": vname,
+            "Vehicle Tags": vehicle_tags,
+            "Tag Paths": tag_paths,
+            "Vehicle Id": str(vid),
+            "Make/Model": make_model,
+            "Safety Score": s.get("safetyScore"),
+
+            "Drive Time (hh:mm:ss)": fmt_hms(s.get("driveTimeMs")),
+            "Total Distance (mi)": fmt_miles(s.get("distanceMeters")),
+
+            "Total Events": s.get("totalEvents", 0),
+            "Total Behaviors": s.get("totalBehaviors", 0),
+
+            # NEW: capture aggregate overspeed time if severity breakdown missing
+            "Time Over Speed Limit (hh:mm:ss) - Total": fmt_hms(s.get("overSpeedTotalMs")),
+            "Percent Over Speed (Total)": pct(s.get("overSpeedTotalMs")),
+
+            "Time Over Speed Limit (hh:mm:ss) - Light": fmt_hms(s.get("overSpeedLightMs")),
+            "Time Over Speed Limit (hh:mm:ss) - Moderate": fmt_hms(s.get("overSpeedModerateMs")),
+            "Time Over Speed Limit (hh:mm:ss) - Heavy": fmt_hms(s.get("overSpeedHeavyMs")),
+            "Time Over Speed Limit (hh:mm:ss) - Severe": fmt_hms(s.get("overSpeedSevereMs")),
+            "Time Over Max Speed (hh:mm:ss)": fmt_hms(s.get("timeOverMaxSpeedMs")),
+            "Speeding (Manual)": s.get("speedingManualCount", 0) or 0,
+
+            "Percent Light Speeding": pct(s.get("overSpeedLightMs")),
+            "Percent Moderate Speeding": pct(s.get("overSpeedModerateMs")),
+            "Percent Heavy Speeding": pct(s.get("overSpeedHeavyMs")),
+            "Percent Severe Speeding": pct(s.get("overSpeedSevereMs")),
+            "Percent Max Speed": pct(s.get("timeOverMaxSpeedMs")),
+
+            "Light Speeding Events Count": s.get("lightSpeedCount", 0) or 0,
+            "Moderate Speeding Events Count": s.get("moderateSpeedCount", 0) or 0,
+            "Heavy Speeding Events Count": s.get("heavySpeedCount", 0) or 0,
+            "Severe Speeding Events Count": s.get("severeSpeedCount", 0) or 0,
+            "Max Speed Events Count": s.get("maxSpeedCount", 0) or 0,
+
+            "Max Speed (mph)": s.get("maxSpeedMph") or "",
+            "Max Speed At": fmt_compact_local(s.get("maxSpeedAtMs"), DISPLAY_TZ),
+
+            "Crash": s.get("crashCount", 0) or 0,
+            "Following Distance": s.get("followingDistanceCount", 0) or 0,
+            "Following of 0-2s (Manual)": s.get("following02Manual", 0) or 0,
+            "Following of 2-4s (Manual)": s.get("following24Manual", 0) or 0,
+            "Late Response (Manual)": s.get("lateResponseManual", 0) or 0,
+            "Defensive Driving (Manual)": s.get("defensiveDrivingManual", 0) or 0,
+            "Near Collision (Manual)": s.get("nearCollisionManual", 0) or 0,
+            "Harsh Accel": s.get("harshAccel", 0) or 0,
+            "Harsh Brake": s.get("harshBrake", 0) or 0,
+            "Harsh Turn": s.get("harshTurn", 0) or 0,
+            "Mobile Usage": s.get("mobileUsage", 0) or 0,
+            "Inattentive Driving": s.get("inattentive", 0) or 0,
+            "Drowsy": s.get("drowsy", 0) or 0,
+            "Rolling Stop": s.get("rollingStop", 0) or 0,
+            "Did Not Yield (Manual)": s.get("didNotYieldManual", 0) or 0,
+            "Ran Red Light (Manual)": s.get("ranRedLightManual", 0) or 0,
+            "Lane Departure (Manual)": s.get("laneDepartureManual", 0) or 0,
+            "Obstructed Camera (Automatic)": s.get("obstructedCameraAuto", 0) or 0,
+            "Obstructed Camera (Manual)": s.get("obstructedCameraManual", 0) or 0,
+            "Eating/Drinking (Manual)": s.get("eatingDrinkingManual", 0) or 0,
+            "Smoking (Manual)": s.get("smokingManual", 0) or 0,
+            "No Seat Belt": s.get("noSeatBelt", 0) or 0,
+            "Forward Collision Warning": s.get("forwardCollisionWarning", 0) or 0,
+        }
+        rows.append(row)
+
+    # Sort & rank
+    def _score(x):
+        v = x.get("Safety Score")
+        try:
+            return float(v) if v is not None else -1
+        except Exception:
+            return -1
+    rows.sort(key=lambda r: (_score(r), hms_to_seconds(r["Drive Time (hh:mm:ss)"])), reverse=True)
+    for idx, r in enumerate(rows, start=1):
+        r["Rank"] = idx
+        r["WE Date"] = we_date
+
+    # Debug: print the top included row’s raw & normalized
+    if rows:
+        top_vid = rows[0]["Vehicle Id"]
+        pp_json("TOP ROW Raw Safety Score JSON (Included)", scores_by_vehicle.get(top_vid, {}))
+        pp_json("TOP ROW Normalized Score Block (Included)", norm_score_block(scores_by_vehicle.get(top_vid, {})))
+
+    header = [
+        "WE Date","Rank","Vehicle Name","Vehicle Tags","Tag Paths","Vehicle Id","Make/Model","Safety Score",
+        "Drive Time (hh:mm:ss)","Total Distance (mi)","Total Events","Total Behaviors",
+        "Time Over Speed Limit (hh:mm:ss) - Total","Percent Over Speed (Total)",
+        "Time Over Speed Limit (hh:mm:ss) - Light","Time Over Speed Limit (hh:mm:ss) - Moderate",
+        "Time Over Speed Limit (hh:mm:ss) - Heavy","Time Over Speed Limit (hh:mm:ss) - Severe",
+        "Time Over Max Speed (hh:mm:ss)","Speeding (Manual)",
+        "Percent Light Speeding","Percent Moderate Speeding","Percent Heavy Speeding","Percent Severe Speeding","Percent Max Speed",
+        "Light Speeding Events Count","Moderate Speeding Events Count","Heavy Speeding Events Count","Severe Speeding Events Count","Max Speed Events Count",
+        "Max Speed (mph)","Max Speed At","Crash","Following Distance","Following of 0-2s (Manual)","Following of 2-4s (Manual)",
+        "Late Response (Manual)","Defensive Driving (Manual)","Near Collision (Manual)","Harsh Accel","Harsh Brake","Harsh Turn",
+        "Mobile Usage","Inattentive Driving","Drowsy","Rolling Stop","Did Not Yield (Manual)","Ran Red Light (Manual)",
+        "Lane Departure (Manual)","Obstructed Camera (Automatic)","Obstructed Camera (Manual)","Eating/Drinking (Manual)",
+        "Smoking (Manual)","No Seat Belt","Forward Collision Warning",
+    ]
+
+    os.makedirs(os.path.dirname(CSV_FILE), exist_ok=True)
+    log(f"Writing: {CSV_FILE}")
+    with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+    log(f"Done. Rows written: {len(rows)}")
+
+if __name__ == "__main__":
+    main()
